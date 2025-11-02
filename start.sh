@@ -61,7 +61,7 @@ cd "${PROJECT_ROOT}"
 php -S "0.0.0.0:${PHP_PORT}" -t "${PROJECT_ROOT}" &
 PHP_PID=$!
 
-python3 "${PROJECT_ROOT}/1.py" &
+python3 "${PROJECT_ROOT}/detect.py" &
 PY_PID=$!
 
 cleanup() {

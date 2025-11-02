@@ -1,0 +1,36 @@
+.lyric {
+  max-height: 70vh;
+  width: 100%;
+  overflow-y: hidden;
+  overflow-x: hidden;
+  text-align: center;
+  color: #bbb;
+  line-height: 2.1em;
+  transition: all 0.3s ease;
+  font-size: 26px;
+  scroll-behavior: smooth;
+}
+
+
+
+.lyric p {
+  font-size: 26px;
+  margin: 8px 0;
+  opacity: 0.45;
+  transition: opacity 0.3s, color 0.3s, transform 0.3s;
+  scroll-margin: 40vh;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6em;
+  filter: blur(2px);
+}
+
+.lyric p.active {
+  color: #fff;
+  opacity: 1;
+  font-weight: 600;
+  transform: scale(1.12);
+  filter: blur(0px);
+}

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PROJECT_ROOT="${SCRIPT_DIR}"
 
 SERVICE_NAME="mus-app"
 USER_NAME="$(id -un)"
@@ -63,7 +63,7 @@ Type=simple
 User=${USER_NAME}
 WorkingDirectory=${PROJECT_ROOT}
 Environment=PHP_PORT=${PHP_PORT}
-ExecStart="${PROJECT_ROOT}/scripts/setup_and_start.sh" --skip-install --php-port ${PHP_PORT}
+ExecStart="${PROJECT_ROOT}/start.sh" --skip-install --php-port ${PHP_PORT}
 Restart=on-failure
 RestartSec=5
 

@@ -5,13 +5,20 @@ header('Access-Control-Allow-Methods: POST, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type');
 require 'func.php';
 
+function hasSearchableMetadata(string $artist, string $title): bool
+{
+    $unknownValues = ['', 'unknown', 'unknown artist', 'unknown title'];
+    return !in_array(strtolower(trim($artist)), $unknownValues, true)
+        && !in_array(strtolower(trim($title)), $unknownValues, true);
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     http_response_code(200);
     exit;
 }
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     http_response_code(405);
-    echo json_encode(['error' => 'Метод не разрешён. Используйте POST.']);
+    echo json_encode(['error' => 'Method not allowed. Use POST.']);
     exit;
 }
 $input = file_get_contents('php://input');
@@ -19,7 +26,7 @@ $data = json_decode($input, true);
 
 if (!is_array($data)) {
     http_response_code(400);
-    echo json_encode(['error' => 'Некорректный JSON']);
+    echo json_encode(['error' => 'Invalid JSON']);
     exit;
 }
 
@@ -35,12 +42,29 @@ switch ($action) {
         break;
 
     case 'GetArt':
-        $playerData = GetData();
-        $artist = $playerData['artist'] ?? '';
-        $title  = $playerData['title'] ?? '';
+        $artist = trim((string) ($data['artist'] ?? ''));
+        $title  = trim((string) ($data['title'] ?? ''));
+
+        if ($artist === '' || $title === '') {
+            $playerData = GetData();
+            $artist = $playerData['artist'] ?? '';
+            $title  = $playerData['title'] ?? '';
+        }
+
+        if (!hasSearchableMetadata($artist, $title)) {
+            echo json_encode([
+                'status' => 'not_found',
+                'reason' => 'unknown_metadata',
+                'artist' => $artist,
+                'title' => $title,
+                'link' => ''
+            ], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+            break;
+        }
+
         $link = GetArt($artist, $title);
         echo json_encode([
-            'status' => 'ok',
+            'status' => $link === '' ? 'not_found' : 'ok',
             'artist' => $artist,
             'title' => $title,
             'link' => $link
@@ -48,31 +72,59 @@ switch ($action) {
         break;
 
     case 'GetLyric':
-    $playerData = GetData();
-    $artist = $playerData['artist'] ?? '';
-    $title  = $playerData['title'] ?? '';
-    $lyric  = GetLyric($artist, $title);
+        $artist = trim((string) ($data['artist'] ?? ''));
+        $title  = trim((string) ($data['title'] ?? ''));
 
-    if (!$lyric) {
+        if ($artist === '' || $title === '') {
+            $playerData = GetData();
+            $artist = $playerData['artist'] ?? '';
+            $title  = $playerData['title'] ?? '';
+        }
+
+        if (!hasSearchableMetadata($artist, $title)) {
+            echo json_encode([
+                'status' => 'not_found',
+                'reason' => 'unknown_metadata',
+                'message' => 'Metadata is unknown',
+                'artist' => $artist,
+                'title' => $title
+            ], JSON_UNESCAPED_UNICODE);
+            break;
+        }
+
+        $lyric = GetLyric($artist, $title);
+
+        if (!$lyric) {
+            echo json_encode([
+                'status' => 'not_found',
+                'message' => 'Lyrics not found',
+                'artist' => $artist,
+                'title' => $title
+            ], JSON_UNESCAPED_UNICODE);
+            break;
+        }
+
         echo json_encode([
-            'status' => 'error',
-            'message' => 'Текст не найден'
-        ], JSON_UNESCAPED_UNICODE);
+            'status' => 'ok',
+            'artist' => $artist,
+            'title'  => $title,
+            'lyrics' => $lyric
+        ], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
         break;
-    }
 
-    echo json_encode([
-        'status' => 'ok',
-        'artist' => $artist,
-        'title'  => $title,
-        'lyrics' => $lyric
-    ], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
-    break;
+    case 'PlayerCommand':
+        $command = (string) ($data['command'] ?? '');
+        $result = ControlPlayer($command);
 
-    
+        if (($result['status'] ?? '') !== 'ok') {
+            http_response_code(400);
+        }
+
+        echo json_encode($result, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+        break;
 
     default:
         http_response_code(400);
-        echo json_encode(['error' => 'Неизвестное действие']);
+        echo json_encode(['error' => 'Unknown action']);
         break;
 }

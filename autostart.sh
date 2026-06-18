@@ -3,6 +3,20 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${SCRIPT_DIR}"
+ENV_FILE="${PROJECT_ROOT}/.env"
+ENV_EXAMPLE="${PROJECT_ROOT}/.env.example"
+
+if [[ ! -f "${ENV_FILE}" && -f "${ENV_EXAMPLE}" ]]; then
+  cp "${ENV_EXAMPLE}" "${ENV_FILE}"
+  echo "Created ${ENV_FILE}. Edit it if you need custom ports or API keys."
+fi
+
+if [[ -f "${ENV_FILE}" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${ENV_FILE}"
+  set +a
+fi
 
 SERVICE_NAME="mus-app"
 USER_NAME="$(id -un)"
@@ -62,8 +76,9 @@ Wants=network-online.target
 Type=simple
 User=${USER_NAME}
 WorkingDirectory=${PROJECT_ROOT}
+EnvironmentFile=-${ENV_FILE}
 Environment=PHP_PORT=${PHP_PORT}
-ExecStart="${PROJECT_ROOT}/start.sh" --skip-install --php-port ${PHP_PORT}
+ExecStart="${PROJECT_ROOT}/start.sh" --skip-install
 Restart=on-failure
 RestartSec=5
 

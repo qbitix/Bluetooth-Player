@@ -45,7 +45,7 @@ chmod +x start.sh autostart.sh
 ./autostart.sh
 ```
 
-<img width="16" height="16" alt="Spotify" src="https://upload.wikimedia.org/wikipedia/commons/8/84/Spotify_icon.svg" /> Так же вам понадобится [Secret key (Spotify API)](https://developer.spotify.com/dashboard) для настройки конфига (.env)
+Обложки треков загружаются через iTunes Search API, Spotify API, MusicBrainz и Cover Art Archive. Spotify используется как дополнительный источник, если в `.env` указаны `SPOTIFY_CLIENT_ID` и `SPOTIFY_CLIENT_SECRET`.
 
 
 ## 🖥 Использование

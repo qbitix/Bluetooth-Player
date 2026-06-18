@@ -14,8 +14,44 @@ let lastLyricHash = null;
 
 let lastSyncPos = 0;
 let lastSyncTime = 0;
+let lastTrackKey = null;
 
 const lyricContainer = () => document.getElementById('lyric');
+
+const lyricTrackKeyOf = (state) => {
+  if (!state) return null;
+  const artist = (state.artist || '').trim().toLowerCase();
+  const title = (state.title || '').trim().toLowerCase();
+  if (!artist && !title) return null;
+  return `${artist}::${title}`;
+};
+
+const resetLyricProgress = () => {
+  if (currentLine >= 0 && lyricElements[currentLine]) {
+    lyricElements[currentLine].classList.remove('active');
+  }
+
+  currentLine = -1;
+
+  const container = lyricContainer();
+  if (container) {
+    container.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+};
+
+const setLyricElements = (items) => {
+  lyricElements = Array.from(items);
+};
+
+const appendLyricLine = (container, text, className = '') => {
+  const p = document.createElement('p');
+  p.textContent = text || ' ';
+  if (className) {
+    p.className = className;
+  }
+  container.appendChild(p);
+  return p;
+};
 
 const setActiveLine = (index) => {
   if (index === currentLine) return;
@@ -37,6 +73,27 @@ const setActiveLine = (index) => {
   }
 };
 
+function renderLyricLoading() {
+  const lyricEl = lyricContainer();
+  if (!lyricEl) return;
+
+  lastLyricHash = '::loading::';
+  lyricLines = [];
+  lyricElements = [];
+  resetLyricProgress();
+
+  const loader = document.createElement('div');
+  loader.className = 'lyric-loading';
+  loader.setAttribute('role', 'status');
+  loader.setAttribute('aria-label', 'Loading lyrics');
+
+  for (let i = 0; i < 3; i += 1) {
+    loader.appendChild(document.createElement('span'));
+  }
+
+  lyricEl.replaceChildren(loader);
+}
+
 function renderLyric(text) {
   const lyricEl = lyricContainer();
   if (!lyricEl) return;
@@ -46,13 +103,13 @@ function renderLyric(text) {
   if (newHash === lastLyricHash) return;
   lastLyricHash = newHash;
 
-  lyricEl.innerHTML = '';
+  lyricEl.replaceChildren();
 
   if (!normalizedText) {
-    lyricEl.innerHTML = '<p style="filter: blur(0px);" class="lyric-empty">Lyric not found 😔</p>';
+    const emptyLine = appendLyricLine(lyricEl, 'Lyric not found :(', 'lyric-empty');
     lyricLines = [];
-    lyricElements = lyricEl.querySelectorAll('p');
-    currentLine = -1;
+    setLyricElements([emptyLine]);
+    resetLyricProgress();
     return;
   }
 
@@ -70,28 +127,53 @@ function renderLyric(text) {
       })
       .filter(Boolean);
 
-    lyricLines.forEach(({ text: lineText }, idx) => {
-      const p = document.createElement('p');
-      p.textContent = lineText || ' ';
-      lyricEl.appendChild(p);
-    });
+    const fragment = document.createDocumentFragment();
+    const elements = lyricLines.map(({ text: lineText }) => appendLyricLine(fragment, lineText));
 
-    lyricElements = lyricEl.querySelectorAll('p');
+    lyricEl.appendChild(fragment);
+    setLyricElements(elements);
   } else {
-    lyricEl.innerHTML = normalizedText
+    const fragment = document.createDocumentFragment();
+    const elements = normalizedText
       .split('\n')
-      .map((line) => `<p>${line}</p>`)
-      .join('');
+      .map((line) => appendLyricLine(fragment, line));
+
+    lyricEl.appendChild(fragment);
     lyricLines = [];
-    lyricElements = lyricEl.querySelectorAll('p');
+    setLyricElements(elements);
   }
 
-  currentLine = -1;
+  resetLyricProgress();
 }
 
 function updatePlayerState(state) {
   if (!state) return;
-  lastSyncPos = state.position_ms || 0;
+  const nextTrackKey = lyricTrackKeyOf(state);
+  const nextPos = Math.max(0, state.position_ms || 0);
+
+  if (nextTrackKey && nextTrackKey !== lastTrackKey) {
+    lastTrackKey = nextTrackKey;
+    lastSyncPos = nextPos;
+    lastSyncTime = performance.now();
+    currentLine = -1;
+    return;
+  }
+
+  if (state.status === 'playing') {
+    const currentEstimatedPos = getAccuratePosition() - LYRIC_OFFSET_MS;
+    const smallBackstep = nextPos < currentEstimatedPos && currentEstimatedPos - nextPos < 1500;
+    const largeBackstep = nextPos < currentEstimatedPos && currentEstimatedPos - nextPos >= 3000;
+
+    if (smallBackstep) {
+      return;
+    }
+
+    if (largeBackstep) {
+      resetLyricProgress();
+    }
+  }
+
+  lastSyncPos = nextPos;
   lastSyncTime = performance.now();
 }
 
@@ -105,29 +187,22 @@ function updateLyricProgress(positionMs) {
   if (!lyricLines.length) return;
 
   const hysteresis = LYRIC_HYSTERESIS_MS;
+  let targetIndex = -1;
 
-  if (currentLine === -1) {
-    const idx = lyricLines.findIndex((line) => positionMs + hysteresis >= line.time);
-    if (idx !== -1) {
-      setActiveLine(idx);
+  for (let i = 0; i < lyricLines.length; i += 1) {
+    if (positionMs + hysteresis >= lyricLines[i].time) {
+      targetIndex = i;
+    } else {
+      break;
     }
+  }
+
+  if (targetIndex === -1) {
     return;
   }
 
-  let targetIndex = currentLine;
-
-  while (
-    targetIndex < lyricLines.length - 1 &&
-    positionMs + hysteresis >= lyricLines[targetIndex + 1].time
-  ) {
-    targetIndex += 1;
-  }
-
-  while (
-    targetIndex > 0 &&
-    positionMs < lyricLines[targetIndex].time - hysteresis
-  ) {
-    targetIndex -= 1;
+  if (currentLine !== -1 && targetIndex < currentLine) {
+    return;
   }
 
   if (targetIndex !== currentLine) {
@@ -150,9 +225,14 @@ window.addEventListener('load', () => {
 
   store.subscribe('state', updatePlayerState);
   store.subscribe('track', () => {
-    lastLyricHash = null;
-    currentLine = -1;
-    renderLyric(store.getState()?.lyrics || '');
+    resetLyricProgress();
+    renderLyricLoading();
+  });
+  store.subscribe('trackRestart', resetLyricProgress);
+  store.subscribe('lyricsLoading', (loading) => {
+    if (loading) {
+      renderLyricLoading();
+    }
   });
   store.subscribe('lyrics', (lyrics) => {
     renderLyric(lyrics);

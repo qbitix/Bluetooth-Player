@@ -1,17 +1,62 @@
 #!/usr/bin/env python3
 import asyncio
+import base64
+import hashlib
 import json
 import logging
+import os
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from dbus_next.aio import MessageBus
 from dbus_next.constants import BusType
 
-STATE_FILE = "/tmp/btplayer_state.json"
-UPDATE_INTERVAL = 2 
-WEB_HOST = "0.0.0.0"
-WEB_PORT = 8080
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def load_env_file(path: str = os.path.join(SCRIPT_DIR, ".env")) -> None:
+    if not os.path.isfile(path):
+        return
+
+    with open(path, "r", encoding="utf-8") as env_file:
+        for line in env_file:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            name, value = line.split("=", 1)
+            name = name.strip()
+            value = value.strip().strip("\"'")
+
+            if name and name not in os.environ:
+                os.environ[name] = value
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+load_env_file()
+
+STATE_FILE = os.environ.get("PLAYER_STATE_FILE", "runtime/btplayer_state.json")
+if not os.path.isabs(STATE_FILE):
+    STATE_FILE = os.path.join(SCRIPT_DIR, STATE_FILE)
+UPDATE_INTERVAL = env_float("PLAYER_DBUS_INTERVAL", 2)
+TIMELINE_INTERVAL = env_float("PLAYER_TIMELINE_INTERVAL", 0.25)
+WEB_HOST = os.environ.get("PLAYER_WS_HOST", "0.0.0.0")
+WEB_PORT = env_int("PLAYER_WS_PORT", 8080)
+WS_PATH = "/ws"
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 HTTP_STATUS_TEXT = {
     200: "OK",
@@ -28,6 +73,11 @@ latest_state: Dict[str, Any] = {
     "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
 }
 state_lock = asyncio.Lock()
+latest_state_monotonic = time.monotonic()
+ws_clients: set[asyncio.StreamWriter] = set()
+ws_clients_lock = asyncio.Lock()
+active_player_path: Optional[str] = None
+active_player_lock = asyncio.Lock()
 
 
 def track_key(state: Dict[str, Any]) -> Optional[str]:
@@ -44,21 +94,39 @@ async def update_state(payload: Dict[str, Any], persist: bool = True) -> None:
     payload.setdefault("updated", time.strftime("%Y-%m-%d %H:%M:%S"))
 
     async with state_lock:
-        global latest_state
+        global latest_state, latest_state_monotonic
         latest_state = payload
+        latest_state_monotonic = time.monotonic()
 
     if not persist:
+        await broadcast_state(payload)
         return
 
     try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
         with open(STATE_FILE, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2)
     except Exception as exc:
-        logging.warning("Не удалось записать файл состояния %s: %s", STATE_FILE, exc)
+        logging.warning("Could not write state file %s: %s", STATE_FILE, exc)
+
+    await broadcast_state(payload)
 
 
-async def find_player(bus: MessageBus) -> Optional[str]:
-    """Ищет путь player0 на любом Bluetooth-адаптере."""
+async def set_active_player_path(player_path: Optional[str]) -> None:
+    async with active_player_lock:
+        global active_player_path
+        active_player_path = player_path
+
+
+async def get_active_player_path() -> Optional[str]:
+    async with active_player_lock:
+        return active_player_path
+
+
+async def list_player_paths(bus: MessageBus) -> list[str]:
+    """Ищет все Bluetooth MediaPlayer на всех адаптерах."""
+    players: list[str] = []
+
     try:
         root = await bus.introspect("org.bluez", "/org/bluez")
         for hci in root.nodes:
@@ -79,11 +147,54 @@ async def find_player(bus: MessageBus) -> Optional[str]:
                 except Exception:
                     continue
 
-                if any("player0" in n.name for n in sub.nodes):
-                    return f"{path}/player0"
+                for player_node in sub.nodes:
+                    if player_node.name.startswith("player"):
+                        players.append(f"{path}/{player_node.name}")
     except Exception:
         pass
-    return None
+
+    return players
+
+
+def player_score(state: Dict[str, Any], player_path: str, current_path: Optional[str]) -> Tuple[int, int, int]:
+    status = str(state.get("status") or "").lower()
+    has_track = track_key(state) is not None
+    has_position = isinstance(state.get("position_ms"), (int, float))
+
+    status_score = {
+        "playing": 4,
+        "paused": 3,
+        "stopped": 2,
+    }.get(status, 1)
+
+    return (
+        status_score,
+        1 if has_track and has_position else 0,
+        1 if player_path == current_path else 0,
+    )
+
+
+async def find_player(bus: MessageBus, current_path: Optional[str] = None) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Выбирает лучший активный Bluetooth-плеер среди всех доступных."""
+    best_path: Optional[str] = None
+    best_state: Optional[Dict[str, Any]] = None
+    best_score: Tuple[int, int, int] = (-1, -1, -1)
+
+    for player_path in await list_player_paths(bus):
+        state = await read_player_state(bus, player_path)
+        if state.get("status") == "error":
+            continue
+
+        score = player_score(state, player_path, current_path)
+        if score > best_score:
+            best_score = score
+            best_path = player_path
+            best_state = state
+
+    if best_path:
+        return best_path, best_state
+
+    return None, None
 
 
 async def read_player_state(bus: MessageBus, player_path: str) -> Dict[str, Any]:
@@ -131,30 +242,38 @@ async def monitor_loop(bus: MessageBus) -> None:
     previous_track: Optional[str] = None
 
     while True:
-        if not player_path:
-            player_path = await find_player(bus)
-            if not player_path:
-                async with state_lock:
-                    current_snapshot = dict(latest_state)
-                await update_state(
-                    {
-                        **current_snapshot,
-                        "status": "idle",
-                        "message": "Нет активного Bluetooth-плеера",
-                        "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    },
-                    persist=False,
-                )
-                await asyncio.sleep(UPDATE_INTERVAL)
-                continue
-            logging.info("Обнаружен плеер: %s", player_path)
+        detected_player_path, data = await find_player(bus, player_path)
+        if not detected_player_path:
+            async with state_lock:
+                current_snapshot = dict(latest_state)
+            await update_state(
+                {
+                    **current_snapshot,
+                    "status": "idle",
+                    "message": "No active Bluetooth player",
+                    "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+                },
+                persist=False,
+            )
+            player_path = None
+            await set_active_player_path(None)
+            await asyncio.sleep(UPDATE_INTERVAL)
+            continue
 
-        data = await read_player_state(bus, player_path)
+        if detected_player_path != player_path:
+            player_path = detected_player_path
+            await set_active_player_path(player_path)
+            previous_track = None
+            logging.info("Active player: %s", player_path)
+
+        if data is None:
+            data = await read_player_state(bus, player_path)
 
         if data.get("status") == "error":
-            logging.warning("Ошибка чтения: %s", data.get("message"))
+            logging.warning("Read error: %s", data.get("message"))
             await update_state(data, persist=False)
             player_path = None
+            await set_active_player_path(None)
             await asyncio.sleep(UPDATE_INTERVAL)
             continue
 
@@ -191,7 +310,7 @@ def build_http_response(
     base_headers = {
         "Content-Type": "application/json; charset=utf-8",
         "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type",
         "Content-Length": str(len(body)),
         "Connection": "close",
@@ -204,7 +323,269 @@ def build_http_response(
     return ("\r\n".join(header_lines) + "\r\n\r\n").encode("utf-8") + body
 
 
-async def http_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+def parse_headers(raw_request: bytes) -> tuple[str, str, Dict[str, str]]:
+    lines = raw_request.decode("iso-8859-1").split("\r\n")
+    method, path, _ = lines[0].split(" ", 2)
+    headers: Dict[str, str] = {}
+
+    for line in lines[1:]:
+        if not line or ":" not in line:
+            continue
+        name, value = line.split(":", 1)
+        headers[name.strip().lower()] = value.strip()
+
+    return method, path, headers
+
+
+async def read_http_body(reader: asyncio.StreamReader, headers: Dict[str, str]) -> bytes:
+    content_length = int(headers.get("content-length", "0") or 0)
+    if content_length <= 0:
+        return b""
+
+    return await reader.readexactly(content_length)
+
+
+async def run_player_command(bus: MessageBus, player_path: str, command: str) -> Dict[str, Any]:
+    try:
+        intros = await bus.introspect("org.bluez", player_path)
+        obj = bus.get_proxy_object("org.bluez", player_path, intros)
+        player = obj.get_interface("org.bluez.MediaPlayer1")
+        next_status: Optional[str] = None
+
+        if command == "previous":
+            await player.call_previous()
+        elif command == "next":
+            await player.call_next()
+        elif command == "play":
+            await player.call_play()
+            next_status = "playing"
+        elif command == "pause":
+            await player.call_pause()
+            next_status = "paused"
+        elif command == "playPause":
+            async with state_lock:
+                state = dict(latest_state)
+
+            if str(state.get("status") or "").lower() == "playing":
+                await player.call_pause()
+                next_status = "paused"
+            else:
+                await player.call_play()
+                next_status = "playing"
+
+        if next_status:
+            async with state_lock:
+                snapshot = dict(latest_state)
+            await update_state({**snapshot, "status": next_status}, persist=True)
+
+        return {"status": "ok", "command": command, "player": player_path}
+    except Exception as exc:
+        logging.warning("Could not run command %s for %s: %s", command, player_path, exc)
+        return {"status": "error", "error": str(exc), "command": command, "player": player_path}
+
+
+async def control_player(bus: MessageBus, command: str) -> Dict[str, Any]:
+    commands = {"previous", "play", "pause", "playPause", "next"}
+    if command not in commands:
+        return {"status": "error", "error": "Unknown command"}
+
+    current_path = await get_active_player_path()
+    if current_path:
+        result = await run_player_command(bus, current_path, command)
+        if result.get("status") == "ok":
+            return result
+
+    player_path, _ = await find_player(bus, current_path)
+    if not player_path:
+        return {"status": "error", "error": "No active Bluetooth player"}
+
+    if player_path != current_path:
+        await set_active_player_path(player_path)
+
+    return await run_player_command(bus, player_path, command)
+
+
+def is_websocket_request(method: str, route: str, headers: Dict[str, str]) -> bool:
+    upgrade = headers.get("upgrade", "").lower()
+    connection = headers.get("connection", "").lower()
+    return (
+        method == "GET"
+        and route == WS_PATH
+        and upgrade == "websocket"
+        and "upgrade" in connection
+        and headers.get("sec-websocket-key", "") != ""
+    )
+
+
+def encode_ws_frame(payload: bytes, opcode: int = 0x1) -> bytes:
+    length = len(payload)
+    first_byte = 0x80 | opcode
+
+    if length < 126:
+        return bytes([first_byte, length]) + payload
+    if length <= 0xFFFF:
+        return bytes([first_byte, 126]) + length.to_bytes(2, "big") + payload
+    return bytes([first_byte, 127]) + length.to_bytes(8, "big") + payload
+
+
+def ws_json_payload(message_type: str, data: Dict[str, Any]) -> bytes:
+    return json.dumps(
+        {
+            "type": message_type,
+            "data": data,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+async def send_ws_frame(writer: asyncio.StreamWriter, payload: bytes, opcode: int = 0x1) -> None:
+    writer.write(encode_ws_frame(payload, opcode))
+    await writer.drain()
+
+
+async def has_ws_clients() -> bool:
+    async with ws_clients_lock:
+        return bool(ws_clients)
+
+
+async def broadcast_ws_payload(payload: bytes) -> None:
+    async with ws_clients_lock:
+        clients = list(ws_clients)
+
+    if not clients:
+        return
+
+    stale_clients: list[asyncio.StreamWriter] = []
+    for writer in clients:
+        try:
+            await asyncio.wait_for(send_ws_frame(writer, payload), timeout=2)
+        except Exception:
+            stale_clients.append(writer)
+
+    if stale_clients:
+        async with ws_clients_lock:
+            for writer in stale_clients:
+                ws_clients.discard(writer)
+                writer.close()
+
+
+async def broadcast_state(state: Dict[str, Any]) -> None:
+    await broadcast_ws_payload(ws_json_payload("playerState", state))
+
+
+def make_timeline_payload(state: Dict[str, Any], anchor_time: float) -> Dict[str, Any]:
+    position = state.get("position_ms", 0) or 0
+    duration = state.get("duration_ms", 0) or 0
+    status = state.get("status", "stopped")
+
+    if status == "playing":
+        position += int((time.monotonic() - anchor_time) * 1000)
+
+    if duration:
+        position = min(position, duration)
+    position = max(position, 0)
+
+    return {
+        "position_ms": position,
+        "duration_ms": duration,
+        "status": status,
+        "track_key": track_key(state),
+        "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+async def timeline_loop() -> None:
+    while True:
+        if await has_ws_clients():
+            async with state_lock:
+                snapshot = dict(latest_state)
+                anchor_time = latest_state_monotonic
+
+            await broadcast_ws_payload(
+                ws_json_payload("timeline", make_timeline_payload(snapshot, anchor_time))
+            )
+
+        await asyncio.sleep(TIMELINE_INTERVAL)
+
+
+async def read_ws_frame(reader: asyncio.StreamReader) -> tuple[int, bytes]:
+    header = await reader.readexactly(2)
+    opcode = header[0] & 0x0F
+    masked = bool(header[1] & 0x80)
+    length = header[1] & 0x7F
+
+    if length == 126:
+        length = int.from_bytes(await reader.readexactly(2), "big")
+    elif length == 127:
+        length = int.from_bytes(await reader.readexactly(8), "big")
+
+    mask = await reader.readexactly(4) if masked else b""
+    payload = await reader.readexactly(length) if length else b""
+
+    if masked:
+        payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+
+    return opcode, payload
+
+
+async def websocket_handler(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    headers: Dict[str, str],
+    bus: MessageBus,
+) -> None:
+    key = headers["sec-websocket-key"]
+    accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode("ascii")).digest()).decode("ascii")
+    response = (
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Accept: {accept}\r\n"
+        "\r\n"
+    ).encode("ascii")
+
+    writer.write(response)
+    await writer.drain()
+
+    async with ws_clients_lock:
+        ws_clients.add(writer)
+
+    async with state_lock:
+        snapshot = dict(latest_state)
+        anchor_time = latest_state_monotonic
+    await send_ws_frame(writer, ws_json_payload("playerState", snapshot))
+    await send_ws_frame(writer, ws_json_payload("timeline", make_timeline_payload(snapshot, anchor_time)))
+
+    try:
+        while True:
+            opcode, payload = await read_ws_frame(reader)
+
+            if opcode == 0x8:
+                await send_ws_frame(writer, payload, opcode=0x8)
+                break
+            if opcode == 0x9:
+                await send_ws_frame(writer, payload, opcode=0xA)
+            if opcode == 0x1:
+                try:
+                    message = json.loads(payload.decode("utf-8") or "{}")
+                except json.JSONDecodeError:
+                    continue
+
+                if message.get("type") == "control":
+                    command = str(message.get("command") or "")
+                    result = await control_player(bus, command)
+                    await send_ws_frame(writer, ws_json_payload("controlResult", result))
+    except (asyncio.IncompleteReadError, ConnectionError):
+        pass
+    finally:
+        async with ws_clients_lock:
+            ws_clients.discard(writer)
+        writer.close()
+        await writer.wait_closed()
+
+
+async def http_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, bus: MessageBus) -> None:
     try:
         raw_request = await reader.readuntil(b"\r\n\r\n")
     except asyncio.IncompleteReadError:
@@ -213,8 +594,7 @@ async def http_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         return
 
     try:
-        request_line = raw_request.decode("iso-8859-1").split("\r\n", 1)[0]
-        method, path, _ = request_line.split(" ", 2)
+        method, path, headers = parse_headers(raw_request)
     except ValueError:
         response = build_http_response(
             json.dumps({"error": "Bad request"}).encode("utf-8"),
@@ -226,15 +606,30 @@ async def http_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         await writer.wait_closed()
         return
 
+    route = path.split("?", 1)[0]
+    if is_websocket_request(method, route, headers):
+        await websocket_handler(reader, writer, headers, bus)
+        return
+
     if method == "OPTIONS":
         response = build_http_response(b"", status=204)
+    elif route == "/control" and method == "POST":
+        try:
+            request_body = await read_http_body(reader, headers)
+            payload = json.loads(request_body.decode("utf-8") or "{}")
+            command = str(payload.get("command") or "")
+            result = await control_player(bus, command)
+            body = json.dumps(result, ensure_ascii=False).encode("utf-8")
+            response = build_http_response(body, status=200 if result.get("status") == "ok" else 400)
+        except (asyncio.IncompleteReadError, json.JSONDecodeError, ValueError):
+            body = json.dumps({"status": "error", "error": "Bad request"}).encode("utf-8")
+            response = build_http_response(body, status=400)
     elif method != "GET":
         response = build_http_response(
             json.dumps({"error": "Method not allowed"}).encode("utf-8"),
             status=405,
         )
     else:
-        route = path.split("?", 1)[0]
         if route in ("/", "/state"):
             async with state_lock:
                 payload = dict(latest_state)
@@ -262,15 +657,22 @@ async def main() -> None:
     await update_state(latest_state, persist=True)
 
     bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-    server = await asyncio.start_server(http_handler, WEB_HOST, WEB_PORT)
+
+    async def server_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await http_handler(reader, writer, bus)
+
+    server = await asyncio.start_server(server_handler, WEB_HOST, WEB_PORT)
 
     host, port = server.sockets[0].getsockname()[:2]
-    logging.info("HTTP сервер запущен на http://%s:%s", host, port)
+    logging.info("HTTP/WebSocket сервер запущен на http://%s:%s", host, port)
+    logging.info("WebSocket endpoint: ws://%s:%s%s", host, port, WS_PATH)
     logging.info("Интервал обновления D-Bus: %ss", UPDATE_INTERVAL)
+    logging.info("Интервал обновления timeline: %.2fs", TIMELINE_INTERVAL)
 
     async with server:
         await asyncio.gather(
             monitor_loop(bus),
+            timeline_loop(),
             server.serve_forever(),
         )
 
